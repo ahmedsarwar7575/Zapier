@@ -4,22 +4,23 @@ const bodyParser = require("body-parser");
 const crypto = require("crypto");
 const app = express();
 app.use(bodyParser.json());
+app.use(express.json());
 const ZOOM_SECRET_TOKEN = process.env.ZOOM_SECRET_TOKEN;
 const meetings = {}; // in-memory store
 
 // handle zoom webhook
 app.post("/zoom", (req, res) => {
+  console.log("Incoming Zoom validation/event:", req.body);
+
   if (req.body.plainToken) {
     const plainToken = req.body.plainToken;
-    const hashForValidate = crypto
-      .createHmac("sha256", ZOOM_SECRET_TOKEN)
+
+    const encryptedToken = crypto
+      .createHmac("sha256", process.env.ZOOM_SECRET_TOKEN)
       .update(plainToken)
       .digest("hex");
 
-    return res.json({
-      plainToken,
-      encryptedToken: hashForValidate,
-    });
+    return res.json({ plainToken, encryptedToken });
   }
 
   // 2. Handle actual meeting events
