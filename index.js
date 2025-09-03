@@ -5,22 +5,34 @@ const crypto = require("crypto");
 const app = express();
 app.use(bodyParser.json());
 app.use(express.json());
-const ZOOM_SECRET_TOKEN = process.env.ZOOM_SECRET_TOKEN;
+// const ZOOM_SECRET_TOKEN = process.env.ZOOM_SECRET_TOKEN;
 const meetings = {}; // in-memory store
 
 // handle zoom webhook
 app.post("/zoom", (req, res) => {
-  console.log("Incoming Zoom validation/event:", req.body);
+  const evt = req.body?.event;
 
-  if (req.body.event === "endpoint.url_validation") {
-    const plainToken = req.body.payload.plainToken;
+  // URL validation
+  if (evt === "endpoint.url_validation") {
+    const plainToken =
+      req.body?.payload?.plainToken ?? req.body?.plainToken ?? "";
+
+    const secret = process.env.ZOOM_SECRET_TOKEN;
+    if (!secret) {
+      console.error("ZOOM_SECRET_TOKEN is not set on the server!");
+      return res.status(500).send("server missing secret");
+    }
+    if (!plainToken) {
+      console.error("No plainToken in request:", req.body);
+      return res.status(400).send("missing plainToken");
+    }
 
     const encryptedToken = crypto
-      .createHmac("sha256", process.env.ZOOM_SECRET_TOKEN)
+      .createHmac("sha256", secret)
       .update(plainToken)
       .digest("hex");
 
-    return res.json({ plainToken, encryptedToken });
+    return res.status(200).json({ plainToken, encryptedToken });
   }
 
   // 2. Handle actual meeting events
