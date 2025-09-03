@@ -12,8 +12,8 @@ const meetings = {}; // in-memory store
 app.post("/zoom", (req, res) => {
   console.log("Incoming Zoom validation/event:", req.body);
 
-  if (req.body.plainToken) {
-    const plainToken = req.body.plainToken;
+  if (req.body.event === "endpoint.url_validation") {
+    const plainToken = req.body.payload.plainToken;
 
     const encryptedToken = crypto
       .createHmac("sha256", process.env.ZOOM_SECRET_TOKEN)
