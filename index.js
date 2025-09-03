@@ -4,12 +4,28 @@ const bodyParser = require("body-parser");
 
 const app = express();
 app.use(bodyParser.json());
-
+const ZOOM_SECRET_TOKEN = process.env.ZOOM_SECRET_TOKEN;
 const meetings = {}; // in-memory store
 
 // handle zoom webhook
 app.post("/zoom", (req, res) => {
+  if (req.body.plainToken) {
+    const plainToken = req.body.plainToken;
+    const hashForValidate = crypto
+      .createHmac("sha256", ZOOM_SECRET_TOKEN)
+      .update(plainToken)
+      .digest("hex");
+
+    return res.json({
+      plainToken,
+      encryptedToken: hashForValidate,
+    });
+  }
+
+  // 2. Handle actual meeting events
   const { event, payload } = req.body;
+  console.log("Zoom event:", event);
+
   const meetingId = payload?.object?.id;
   const hostId = payload?.object?.host_id;
   const participant = payload?.object?.participant;
@@ -65,8 +81,8 @@ app.get("/meetings/:id/status", (req, res) => {
   }
 
   const participants = Object.values(meeting.participants || {});
-  const hostPresent = !!participants.find(p => p.id === hostId);
-  const others = participants.filter(p => p.id !== hostId);
+  const hostPresent = !!participants.find((p) => p.id === hostId);
+  const others = participants.filter((p) => p.id !== hostId);
 
   let outcome = "NONE";
   if (hostPresent && others.length === 0) outcome = "HOST_ONLY";
