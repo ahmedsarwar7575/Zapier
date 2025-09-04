@@ -2,6 +2,7 @@
   "name": "zoom",
   "version": "1.0.0",
   "main": "index.js",
+  "type": "module",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "node index.js"
@@ -11,9 +12,11 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "bullmq": "^5.58.5",
     "crypto": "^1.0.1",
     "dotenv": "^17.2.2",
     "express": "^5.1.0",
-    "ioredis": "^5.7.0"
+    "ioredis": "^5.7.0",
+    "node-fetch": "^3.3.2"
   }
 }
