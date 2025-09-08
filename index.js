@@ -11,21 +11,11 @@ app.use(express.json());
 const redis = new IORedis(process.env.REDIS_URL, { maxRetriesPerRequest: null });
 const queue = new Queue("meeting-check", { connection: redis });
 
-const ZAP_ONE = process.env.ZAPIER_OUTCOME_WEBHOOK_ONE || ""; // fires first
-const ZAP_TWO = process.env.ZAPIER_OUTCOME_WEBHOOK_TWO || ""; // fires second
-
-const RUSH_ONE_MS = Number(process.env.RUSH_DELAY_MS_ONE ?? 10_000);     // 10s
-const RUSH_TWO_MS = Number(process.env.RUSH_DELAY_MS_TWO ?? 300_000);    // 5m
-const DEFAULT_JOB_DELAY_MS = Number(process.env.JOB_DELAY_MS ?? 300_000);// 5m
-
-// --- Keys / helpers ----------------------------------------------------------
 const P = (id) => `presence:${id}`;
 const K_STARTED = (id) => `started:${id}`;
-const K_NOTIF = (id, hookKey) => `notified:${id}:${hookKey}`; // per-webhook dedupe
+const K_NOTIF = (id) => `notified:${id}`;
 const K_RUSH = (id) => `rushed:${id}`;
 const TTL = 60 * 60 * 24;
-
-const nowISO = () => new Date().toISOString();
 
 const keyFrom = (p = {}) => {
   const a = p?.id;
@@ -39,10 +29,18 @@ const keyFrom = (p = {}) => {
   return "";
 };
 
+const nowISO = () => new Date().toISOString();
 const isHost = (p, hostId) =>
   (p?.id && String(p.id) === String(hostId)) ||
   p?.is_host === true ||
   String(p?.role || "").toLowerCase() === "host";
+
+const scheduleCheck = (meetingId, hostId, topic, start_time, timezone, delayMs) =>
+  queue.add(
+    "check",
+    { meetingId, hostId, topic, start_time, timezone, zapHook: process.env.ZAPIER_OUTCOME_WEBHOOK },
+    { delay: Number(delayMs), removeOnComplete: true, removeOnFail: true }
+  );
 
 async function getState(meetingId) {
   const raw = await redis.get(P(meetingId));
@@ -56,61 +54,20 @@ async function setState(meetingId, state) {
 function classify(state, hostIdParam) {
   const present = state.present || {};
   const hostKey = state.hostAccountKey || hostIdParam || state.hostId || null;
-  const hostPresent = hostKey
-    ? !!present[hostKey]
-    : Object.values(present).some((p) => p.isHost);
-  const someoneElsePresent = Object.entries(present).some(([k, p]) =>
-    hostKey ? k !== hostKey : !p.isHost
-  );
-
+  const hostPresent = (hostKey && present[hostKey]) ? true : Object.values(present).some((p) => p.isHost);
+  const someoneElsePresent = Object.entries(present).some(([k, p]) => (hostKey ? k !== hostKey : !p.isHost));
   let outcome = "BOTH_PRESENT";
   if (hostPresent && !someoneElsePresent) outcome = "ONLY_HOST";
   else if (!hostPresent && someoneElsePresent) outcome = "ONLY_PARTICIPANT";
   else if (!hostPresent && !someoneElsePresent) outcome = "NONE";
-
   const person = state.latest_non_host || state.first_non_host || null;
   return { outcome, hostPresent, someoneElsePresent, person };
 }
 
-const hookKey = (url) => {
-  if (!url) return "none";
-  if (ZAP_ONE && url === ZAP_ONE) return "one";
-  if (ZAP_TWO && url === ZAP_TWO) return "two";
-  return crypto.createHash("md5").update(url).digest("hex").slice(0, 6);
-};
-
-const scheduleCheck = (
-  meetingId,
-  hostId,
-  topic,
-  start_time,
-  timezone,
-  zapHook,
-  delayMs,
-  reason
-) =>
-  queue.add(
-    `check:${hookKey(zapHook)}`,
-    {
-      meetingId,
-      hostId,
-      topic,
-      start_time,
-      timezone,
-      zapHook,
-      webhookKey: hookKey(zapHook),
-      reason: reason || "regular",
-    },
-    { delay: Number(delayMs), removeOnComplete: true, removeOnFail: true }
-  );
-
 app.post("/zoom", async (req, res) => {
   if (req.body?.event === "endpoint.url_validation") {
     const plainToken = req.body?.payload?.plainToken;
-    const encryptedToken = crypto
-      .createHmac("sha256", process.env.ZOOM_SECRET_TOKEN)
-      .update(plainToken)
-      .digest("hex");
+    const encryptedToken = crypto.createHmac("sha256", process.env.ZOOM_SECRET_TOKEN).update(plainToken).digest("hex");
     return res.status(200).json({ plainToken, encryptedToken });
   }
 
@@ -150,38 +107,20 @@ app.post("/zoom", async (req, res) => {
       }
 
       const hostKey = state.hostAccountKey || state.hostId || null;
-      const hostPresent = hostKey
-        ? !!state.present[hostKey]
-        : Object.values(state.present).some((pp) => pp.isHost);
-
-      const startedCount = Number(await redis.get(K_STARTED(meetingId))) || 0;
-
-      if (!profile.isHost && !hostPresent && startedCount >= 1) {
-        const rushed = await redis.incr(K_RUSH(meetingId));
-        await redis.expire(K_RUSH(meetingId), TTL);
-        if (rushed === 1) {
-          if (ZAP_ONE) {
+      const hostPresent = hostKey ? !!state.present[hostKey] : Object.values(state.present).some((pp) => pp.isHost);
+      if (!profile.isHost && !hostPresent) {
+        const startedCount = Number(await redis.get(K_STARTED(meetingId))) || 0;
+        if (startedCount >= 1) {
+          const rushed = await redis.incr(K_RUSH(meetingId));
+          await redis.expire(K_RUSH(meetingId), TTL);
+          if (rushed === 1) {
             await scheduleCheck(
               meetingId,
               state.hostId,
               state.topic || null,
               state.start_time || null,
               state.timezone || null,
-              ZAP_ONE,
-              RUSH_ONE_MS,
-              "rush"
-            );
-          }
-          if (ZAP_TWO) {
-            await scheduleCheck(
-              meetingId,
-              state.hostId,
-              state.topic || null,
-              state.start_time || null,
-              state.timezone || null,
-              ZAP_TWO,
-              RUSH_TWO_MS,
-              "rush"
+              Number(process.env.RUSH_DELAY_MS || 10000)
             );
           }
         }
@@ -195,10 +134,7 @@ app.post("/zoom", async (req, res) => {
   }
 
   if (event === "meeting.started") {
-    const topic = obj.topic,
-      hostId = obj.host_id,
-      start_time = obj.start_time,
-      timezone = obj.timezone;
+    const topic = obj.topic, hostId = obj.host_id, start_time = obj.start_time, timezone = obj.timezone;
 
     const s = await getState(meetingId);
     s.hostId = hostId || s.hostId;
@@ -210,29 +146,28 @@ app.post("/zoom", async (req, res) => {
     const started = await redis.incr(K_STARTED(meetingId));
     await redis.expire(K_STARTED(meetingId), TTL);
 
-
-    const delay = DEFAULT_JOB_DELAY_MS; 
+    let delay = Number(process.env.JOB_DELAY_MS || 300000);
+    try {
+      const { outcome } = classify(s, hostId);
+      if (outcome === "ONLY_PARTICIPANT") delay = Number(process.env.RUSH_DELAY_MS || 10000);
+    } catch {}
 
     if (started === 1) {
-      if (ZAP_ONE)
-        await scheduleCheck(meetingId, hostId, s.topic, s.start_time, s.timezone, ZAP_ONE, delay, "started");
-      if (ZAP_TWO)
-        await scheduleCheck(meetingId, hostId, s.topic, s.start_time, s.timezone, ZAP_TWO, delay, "started");
+      await scheduleCheck(meetingId, hostId, s.topic, s.start_time, s.timezone, delay);
     }
     return res.json({ ok: true, scheduled: started === 1, delayMs: delay });
   }
 
-  return res.json({ ok: true });
+  res.json({ ok: true });
 });
 
 new Worker(
   "meeting-check",
   async (job) => {
-    const { meetingId, hostId, topic, start_time, timezone, zapHook, webhookKey, reason } = job.data;
-
-    const notified = await redis.incr(K_NOTIF(meetingId, webhookKey));
-    await redis.expire(K_NOTIF(meetingId, webhookKey), TTL);
-    if (notified !== 1) return { skipped: "already-notified", webhook: webhookKey, reason };
+    const { meetingId, hostId, topic, start_time, timezone, zapHook } = job.data;
+    const notified = await redis.incr(K_NOTIF(meetingId));
+    await redis.expire(K_NOTIF(meetingId), TTL);
+    if (notified !== 1) return { skipped: "already-notified" };
 
     const state = await getState(meetingId);
     const result = classify(state, hostId);
@@ -249,21 +184,17 @@ new Worker(
           timezone,
           updatedAt: state.updatedAt,
           presentCount: Object.keys(state.present || {}).length,
-          outcome: result.outcome,            
+          outcome: result.outcome,
           hostPresent: result.hostPresent,
           someoneElsePresent: result.someoneElsePresent,
           person: result.person,
-          webhook: webhookKey,                
-          reason,                             
         }),
       });
     }
 
-    return { posted: !!zapHook, webhook: webhookKey, outcome: result.outcome, reason };
+    return { posted: !!zapHook, outcome: result.outcome };
   },
-  { connection: redis, concurrency: 1 } 
+  { connection: redis }
 );
 
-app.listen(process.env.PORT || 3000, () => {
-  console.log(`Server listening on :${process.env.PORT || 3000}`);
-});
+app.listen(process.env.PORT || 3000);
