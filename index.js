@@ -7,11 +7,11 @@ import { Queue, Worker } from "bullmq";
 import fetch from "node-fetch";
 
 /**
- * Key behaviors:
- *  - Tracks both "present" (in meeting) and "waiting" (in waiting room / JBH) participants.
- *  - Classify returns `outcome: "WaitingRoom"` if anyone is still waiting at check time.
- *  - Schedules ALL webhooks strictly 5 minutes after Zoom's `meeting.started` (no join-based/rush scheduling).
- *    -> Example: meeting starts 5:00 PM → notifications at 5:05 PM, regardless of who joined before.
+ * What this file guarantees:
+ *  - Classifies presence and Waiting Room; returns outcome "WaitingRoom" if anyone is waiting.
+ *  - Schedules notifications at (scheduled_start_time + 5 minutes), not at actual host start.
+ *    -> Example: meeting scheduled 5:00 PM, host starts 5:30 PM (or never) => notification 5:05 PM.
+ *  - Idempotent: multiple schedules (created/updated/started) won't double-post.
  */
 
 const app = express();
@@ -26,19 +26,18 @@ const queue = new Queue("meeting-check", { connection: redis });
 // ----------------------------------------------------------------------------
 // Webhook endpoints to post results to (first + second, both optional)
 // ----------------------------------------------------------------------------
-const ZAP_ONE = process.env.ZAPIER_OUTCOME_WEBHOOK_ONE || ""; // fires first
-const ZAP_TWO = process.env.ZAPIER_OUTCOME_WEBHOOK_TWO || ""; // fires second
+const ZAP_ONE = process.env.ZAPIER_OUTCOME_WEBHOOK_ONE || "";
+const ZAP_TWO = process.env.ZAPIER_OUTCOME_WEBHOOK_TWO || "";
 
 // ----------------------------------------------------------------------------
-// Timing (defaults: 5 minutes after meeting.started)
+// Timing (defaults: 5 minutes after scheduled start)
 // ----------------------------------------------------------------------------
-const DEFAULT_JOB_DELAY_MS = Number(process.env.JOB_DELAY_MS ?? 300_000); // 5m hard rule
+const DEFAULT_JOB_DELAY_MS = Number(process.env.JOB_DELAY_MS ?? 300_000); // 5m
 
 // ----------------------------------------------------------------------------
 // Redis keys / helpers
 // ----------------------------------------------------------------------------
-const P = (id) => `presence:${id}`;
-const K_STARTED = (id) => `started:${id}`; // times we've seen meeting.started
+const P = (id) => `presence:${id}`;                         // full state per meeting
 const K_NOTIF = (id, hookKey) => `notified:${id}:${hookKey}`; // per-webhook dedupe
 const TTL = 60 * 60 * 24; // 24h
 
@@ -66,12 +65,13 @@ async function getState(meetingId) {
   return raw
     ? JSON.parse(raw)
     : {
-        present: {},   // { [key]: profile }
-        waiting: {},   // { [key]: profile }
+        present: {},            // { [key]: profile }
+        waiting: {},            // { [key]: profile }
         hostId: null,
         hostAccountKey: null,
         topic: null,
-        start_time: null,
+        scheduled_start_time: null, // ISO string from meeting.created/updated
+        start_time: null,           // actual meeting.started time (ISO) if any
         timezone: null,
         first_non_host: null,
         latest_non_host: null,
@@ -127,7 +127,8 @@ const scheduleCheck = (
   meetingId,
   hostId,
   topic,
-  start_time,
+  scheduled_start_time, // ISO string (preferred)
+  start_time,            // actual start if any
   timezone,
   zapHook,
   delayMs,
@@ -139,6 +140,7 @@ const scheduleCheck = (
       meetingId,
       hostId,
       topic,
+      scheduled_start_time,
       start_time,
       timezone,
       zapHook,
@@ -148,10 +150,9 @@ const scheduleCheck = (
     { delay: Number(delayMs), removeOnComplete: true, removeOnFail: true }
   );
 
-// Compute ms until (start_time + DEFAULT_JOB_DELAY_MS), clamped at 0
-function msUntilFiveAfterStart(start_time) {
-  const startMs = Date.parse(start_time || new Date().toISOString());
-  const fireAt = startMs + DEFAULT_JOB_DELAY_MS;
+function msUntilFiveAfter(tsISO) {
+  const base = Date.parse(tsISO || new Date().toISOString());
+  const fireAt = base + DEFAULT_JOB_DELAY_MS;
   return Math.max(0, fireAt - Date.now());
 }
 
@@ -176,11 +177,10 @@ app.post("/zoom", async (req, res) => {
 
   // --------------------------------------------------------------------------
   // Waiting Room related events
-  // (Handle multiple canonical names to be future- / past-proof)
   // --------------------------------------------------------------------------
   const WR_JOIN_EVENTS = new Set([
     "meeting.participant_joined_waiting_room",
-    "meeting.participant_jbh_waiting",         // joined before host
+    "meeting.participant_jbh_waiting",         // joined before host (waiting for host)
     "meeting.participant_put_in_waiting_room", // moved back to WR during meeting
   ]);
 
@@ -223,7 +223,7 @@ app.post("/zoom", async (req, res) => {
 
   // --------------------------------------------------------------------------
   // Participant joined/left the actual meeting
-  // (No scheduling here—notifications come ONLY from meeting.started +5m)
+  // (No scheduling here—notifications are based on scheduled start.)
   // --------------------------------------------------------------------------
   if (event === "meeting.participant_joined" || event === "meeting.participant_left") {
     const state = await getState(meetingId);
@@ -267,13 +267,39 @@ app.post("/zoom", async (req, res) => {
   }
 
   // --------------------------------------------------------------------------
-  // Meeting started: schedule checks at exactly start_time + 5 minutes
-  // (Only place jobs are scheduled)
+  // Meeting created / updated: store scheduled start and schedule checks
+  // --------------------------------------------------------------------------
+  if (event === "meeting.created" || event === "meeting.updated") {
+    const topic = obj.topic;
+    const hostId = obj.host_id;
+    const scheduled_start_time = obj.start_time; // ISO (UTC) per Zoom payload
+    const timezone = obj.timezone;
+
+    const s = await getState(meetingId);
+    s.hostId = hostId || s.hostId;
+    s.topic = topic || s.topic || null;
+    s.scheduled_start_time = scheduled_start_time || s.scheduled_start_time || null;
+    s.timezone = timezone || s.timezone || null;
+    await setState(meetingId, s);
+
+    if (scheduled_start_time) {
+      const delay = msUntilFiveAfter(scheduled_start_time);
+      if (ZAP_ONE)
+        await scheduleCheck(meetingId, hostId, s.topic, s.scheduled_start_time, s.start_time, s.timezone, ZAP_ONE, delay, event);
+      if (ZAP_TWO)
+        await scheduleCheck(meetingId, hostId, s.topic, s.scheduled_start_time, s.start_time, s.timezone, ZAP_TWO, delay, event);
+    }
+
+    return res.json({ ok: true, scheduled: !!scheduled_start_time, event });
+  }
+
+  // --------------------------------------------------------------------------
+  // Meeting started (optional: store actual start; we DO NOT base the time on this)
   // --------------------------------------------------------------------------
   if (event === "meeting.started") {
     const topic = obj.topic,
       hostId = obj.host_id,
-      start_time = obj.start_time, // ISO8601 (UTC)
+      start_time = obj.start_time, // actual start (ISO)
       timezone = obj.timezone;
 
     const s = await getState(meetingId);
@@ -283,22 +309,19 @@ app.post("/zoom", async (req, res) => {
     s.timezone = timezone || s.timezone || null;
     await setState(meetingId, s);
 
-    const started = await redis.incr(K_STARTED(meetingId));
-    await redis.expire(K_STARTED(meetingId), TTL);
-
-    // Always fire 5 minutes after the meeting START time.
-    const delay = msUntilFiveAfterStart(s.start_time);
-
-    if (started === 1) {
+    // Fallback scheduling ONLY if we don't know the scheduled start:
+    if (!s.scheduled_start_time) {
+      const delay = msUntilFiveAfter(start_time);
       if (ZAP_ONE)
-        await scheduleCheck(meetingId, hostId, s.topic, s.start_time, s.timezone, ZAP_ONE, delay, "started");
+        await scheduleCheck(meetingId, hostId, s.topic, s.scheduled_start_time, s.start_time, s.timezone, ZAP_ONE, delay, "started-fallback");
       if (ZAP_TWO)
-        await scheduleCheck(meetingId, hostId, s.topic, s.start_time, s.timezone, ZAP_TWO, delay, "started");
+        await scheduleCheck(meetingId, hostId, s.topic, s.scheduled_start_time, s.start_time, s.timezone, ZAP_TWO, delay, "started-fallback");
     }
-    return res.json({ ok: true, scheduled: started === 1, delayMs: delay });
+
+    return res.json({ ok: true, scheduledFallback: !s.scheduled_start_time });
   }
 
-  // Unknown or unhandled event
+  // Unknown/unhandled event
   return res.json({ ok: true, event, note: "unhandled-event-type (ignored)" });
 });
 
@@ -308,14 +331,53 @@ app.post("/zoom", async (req, res) => {
 new Worker(
   "meeting-check",
   async (job) => {
-    const { meetingId, hostId, topic, start_time, timezone, zapHook, webhookKey, reason } = job.data;
+    const {
+      meetingId,
+      hostId,
+      topic,
+      scheduled_start_time: jobSched,
+      start_time: jobActualStart,
+      timezone,
+      zapHook,
+      webhookKey,
+      reason,
+    } = job.data;
 
-    // de-dupe per webhook
+    const state = await getState(meetingId);
+
+    // Choose the best known scheduled start (prefer job payload, then state)
+    const scheduledISO =
+      jobSched ||
+      state.scheduled_start_time ||
+      null;
+
+    // If we have a scheduled start, enforce "not before scheduled+5m"
+    if (scheduledISO) {
+      const minFireAt = Date.parse(scheduledISO) + DEFAULT_JOB_DELAY_MS;
+      const now = Date.now();
+      if (now < minFireAt) {
+        // Too early (perhaps meeting time was moved) → re-enqueue for the remaining delay
+        const delay = Math.max(0, minFireAt - now);
+        await scheduleCheck(
+          meetingId,
+          hostId,
+          topic,
+          scheduledISO,
+          jobActualStart || state.start_time,
+          timezone,
+          zapHook,
+          delay,
+          "rescheduled-to-scheduled+5m"
+        );
+        return { rescheduled: true, webhook: webhookKey, delay };
+      }
+    }
+
+    // De-dupe just before posting
     const notified = await redis.incr(K_NOTIF(meetingId, webhookKey));
     await redis.expire(K_NOTIF(meetingId, webhookKey), TTL);
     if (notified !== 1) return { skipped: "already-notified", webhook: webhookKey, reason };
 
-    const state = await getState(meetingId);
     const result = classify(state, hostId);
 
     if (zapHook) {
@@ -326,7 +388,8 @@ new Worker(
           meetingId,
           topic,
           hostId,
-          start_time,
+          scheduled_start_time: scheduledISO,
+          start_time: jobActualStart || state.start_time,
           timezone,
           updatedAt: state.updatedAt,
           presentCount: Object.keys(state.present || {}).length,
